@@ -54,7 +54,9 @@ def generate_gradcam_heatmap(model, img_array, last_conv_layer_name):
     if max_val > 0:
         heatmap = heatmap / max_val
 
-    return heatmap.numpy()
+    # Ensure float32 numpy array (Keras 3 may return non-standard dtypes)
+    result = heatmap.numpy()
+    return np.asarray(result, dtype=np.float32)
 
 
 def create_gradcam_overlay(original_img, heatmap, alpha=0.4):
@@ -70,6 +72,8 @@ def create_gradcam_overlay(original_img, heatmap, alpha=0.4):
         overlay: BGR image with heatmap overlay, uint8
     """
     # Resize heatmap to match image dimensions
+    # Ensure float32 for OpenCV compatibility
+    heatmap = np.asarray(heatmap, dtype=np.float32)
     heatmap_resized = cv2.resize(heatmap, (original_img.shape[1], original_img.shape[0]))
 
     # Apply JET colormap
