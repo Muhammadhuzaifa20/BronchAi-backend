@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+/tmp/
+/models/
+*.h5
+*.keras
+.DS_Store

@@ -1,0 +1,14 @@
+{
+  "name": "bronchai-ml-backend",
+  "description": "ML Backend for BronchAI",
+  "env": {
+    "HF_REPO_ID": {
+      "description": "Hugging Face Models Repository ID",
+      "value": "muhammadhuzaifa2003/New_Model"
+    },
+    "ALLOWED_ORIGINS": {
+      "description": "Allowed origins for CORS",
+      "value": "*"
+    }
+  }
+}

@@ -1,0 +1,248 @@
+"""
+app.py — FastAPI backend for BronchAI lung cancer classification.
+
+Endpoints:
+    GET  /              — Root (Railway default health check)
+    GET  /api/health    — Detailed health check
+    POST /api/predict   — Run ensemble prediction + Grad-CAM on a CT scan image
+"""
+
+import os
+import io
+import logging
+import numpy as np
+import cv2
+import httpx
+from contextlib import asynccontextmanager
+from PIL import Image
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+
+from model_loader import model_manager, PREPROCESS_FUNCS, GRADCAM_LAYERS, IMG_SIZE
+from gradcam import gradcam_to_base64
+
+# ============================================================
+# LOGGING
+# ============================================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# LIFESPAN — Lazy loading: models loaded on first request, not startup
+# ============================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Server lifespan. Models are loaded lazily on first prediction request."""
+    import tensorflow as tf
+    import keras
+    logger.info(f"🚀 Starting BronchAI ML Backend... (TF: {tf.__version__}, Keras: {keras.__version__})")
+    logger.info("📦 Models will be loaded on first prediction request (lazy loading).")
+    yield
+    logger.info("👋 Shutting down BronchAI ML Backend.")
+
+
+# ============================================================
+# APP SETUP
+# ============================================================
+app = FastAPI(
+    title="BronchAI ML Backend",
+    description="Lung Cancer Classification with Ensemble Voting & Grad-CAM",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# CORS — allow your React frontend to call this API
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://bronchai.netlify.app").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# SCHEMAS
+# ============================================================
+class PredictRequest(BaseModel):
+    image_url: str
+    scan_id: Optional[str] = None
+
+
+class ModelResult(BaseModel):
+    name: str
+    prediction: str
+    confidence: float
+
+
+class PredictResponse(BaseModel):
+    prediction: str
+    confidence_score: float
+    models: list[ModelResult]
+    gradcam_base64: Optional[str] = None
+    scan_id: Optional[str] = None
+
+
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+async def download_image_from_url(url: str) -> np.ndarray:
+    """Download an image from a URL and return as numpy array (RGB, 224x224)."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+
+        img = Image.open(io.BytesIO(response.content))
+        img = img.convert("RGB")
+        img = img.resize(IMG_SIZE, Image.LANCZOS)
+        return np.array(img, dtype=np.uint8)
+
+    except Exception as e:
+        logger.error(f"Failed to download image from {url}: {e}")
+        raise HTTPException(status_code=400, detail=f"Could not download image: {str(e)}")
+
+
+def process_uploaded_file(file_bytes: bytes) -> np.ndarray:
+    """Process an uploaded file and return as numpy array (RGB, 224x224)."""
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+        img = img.convert("RGB")
+        img = img.resize(IMG_SIZE, Image.LANCZOS)
+        return np.array(img, dtype=np.uint8)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
+
+
+def ensure_models_loaded():
+    """Lazy-load models on first prediction request."""
+    if not model_manager.loaded:
+        logger.info("📥 First prediction request — loading models now...")
+        model_manager.load_all()
+
+
+def generate_gradcam_for_best_model(img_rgb: np.ndarray) -> Optional[str]:
+    """
+    Generate Grad-CAM using the best available transfer learning model.
+    Priority: VGG16 > ResNet50 > EfficientNetB0
+    (Sequential CNN doesn't have a clean conv layer for Grad-CAM)
+    """
+    for model_name in ["VGG16", "ResNet50", "EfficientNetB0"]:
+        if model_name in model_manager.models and model_name in GRADCAM_LAYERS:
+            model = model_manager.models[model_name]
+            layer_name = GRADCAM_LAYERS[model_name]
+            preprocess_fn = PREPROCESS_FUNCS[model_name]
+
+            # Preprocess for this specific model
+            preprocessed = preprocess_fn(np.copy(img_rgb).astype("float32"))
+            input_batch = np.expand_dims(preprocessed, axis=0)
+
+            result = gradcam_to_base64(img_rgb, model, input_batch, layer_name)
+            if result:
+                return result
+
+    return None
+
+
+# ============================================================
+# ENDPOINTS
+# ============================================================
+
+@app.get("/")
+async def root():
+    """Root endpoint — Railway default health check."""
+    return {"status": "ok", "service": "BronchAI ML Backend"}
+
+
+@app.get("/api/health")
+async def health_check():
+    """Detailed health check endpoint."""
+    import tensorflow as tf
+    import keras
+    loaded_models = list(model_manager.models.keys())
+    return {
+        "status": "ok",
+        "models_loaded": len(loaded_models),
+        "model_names": loaded_models,
+        "models_ready": model_manager.loaded,
+        "tf_version": tf.__version__,
+        "keras_version": keras.__version__
+    }
+
+
+@app.post("/api/predict", response_model=PredictResponse)
+async def predict_from_url(request: PredictRequest):
+    """
+    Run ensemble prediction on a CT scan image from URL.
+
+    The frontend sends the Supabase Storage URL of the uploaded scan.
+    """
+    # Lazy-load models on first request
+    ensure_models_loaded()
+
+    if not model_manager.models:
+        raise HTTPException(status_code=503, detail="Models failed to load. Check server logs.")
+
+    # 1. Download the image
+    img_rgb = await download_image_from_url(request.image_url)
+
+    # 2. Run ensemble prediction
+    result = model_manager.predict(img_rgb)
+
+    # 3. Generate Grad-CAM
+    gradcam_base64 = generate_gradcam_for_best_model(img_rgb)
+
+    return PredictResponse(
+        prediction=result["prediction"],
+        confidence_score=result["confidence_score"],
+        models=result["models"],
+        gradcam_base64=gradcam_base64,
+        scan_id=request.scan_id,
+    )
+
+
+@app.post("/api/predict/upload", response_model=PredictResponse)
+async def predict_from_upload(
+    file: UploadFile = File(...),
+    scan_id: Optional[str] = Form(None),
+):
+    """
+    Run ensemble prediction on a directly uploaded CT scan image.
+    Alternative to URL-based prediction for testing.
+    """
+    # Lazy-load models on first request
+    ensure_models_loaded()
+
+    if not model_manager.models:
+        raise HTTPException(status_code=503, detail="Models failed to load. Check server logs.")
+
+    # 1. Read uploaded file
+    file_bytes = await file.read()
+    img_rgb = process_uploaded_file(file_bytes)
+
+    # 2. Run ensemble prediction
+    result = model_manager.predict(img_rgb)
+
+    # 3. Generate Grad-CAM
+    gradcam_base64 = generate_gradcam_for_best_model(img_rgb)
+
+    return PredictResponse(
+        prediction=result["prediction"],
+        confidence_score=result["confidence_score"],
+        models=result["models"],
+        gradcam_base64=gradcam_base64,
+        scan_id=scan_id,
+    )
+
+
+# ============================================================
+# RUN (for local development)
+# ============================================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
