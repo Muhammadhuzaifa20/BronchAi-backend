@@ -1,8 +1,8 @@
+# Nixpacks build config for Railway
+# Let Nixpacks auto-detect requirements.txt and handle pip install
+
 [phases.setup]
 nixPkgs = ["python311"]
-
-[phases.install]
-cmds = ["pip install --no-cache-dir -r requirements.txt"]
 
 [start]
 cmd = "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"
