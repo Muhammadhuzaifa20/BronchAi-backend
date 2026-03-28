@@ -130,14 +130,14 @@ def gradcam_to_base64(original_img_rgb, model, preprocessed_img, last_conv_layer
         # Convert back to RGB for PIL
         overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
 
-        # Encode as base64 PNG
+        # Encode as base64 JPEG (much faster and smaller than PNG)
         pil_img = Image.fromarray(overlay_rgb)
         buffer = BytesIO()
-        pil_img.save(buffer, format="PNG", quality=90)
+        pil_img.save(buffer, format="JPEG", quality=85)
         buffer.seek(0)
 
         base64_str = base64.b64encode(buffer.read()).decode("utf-8")
-        return f"data:image/png;base64,{base64_str}"
+        return f"data:image/jpeg;base64,{base64_str}"
 
     except Exception as e:
         print(f"Grad-CAM generation failed: {e}")
