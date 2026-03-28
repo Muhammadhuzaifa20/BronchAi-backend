@@ -214,6 +214,61 @@ class ModelManager:
             "models": model_results,
         }
 
+    def predict_stream(self, img_array: np.ndarray):
+        """
+        Run inference yielding progress events on all loaded models.
+        Yields dictionaries with step names and temporary states.
+        """
+        if not self.models:
+            raise RuntimeError("No models loaded! Call load_all() first.")
+
+        model_results = []
+        all_probabilities = []
+
+        yield {"event": "progress", "step": "Image Preprocessing"}
+
+        for name, model in self.models.items():
+            display_name = name if name != "Sequential_CNN" else "Custom CNN"
+            yield {"event": "progress", "step": f"{display_name} Prediction"}
+            
+            # Prepare input: copy + preprocess
+            preprocessed = PREPROCESS_FUNCS[name](np.copy(img_array).astype("float32"))
+            input_batch = np.expand_dims(preprocessed, axis=0)  # (1, 224, 224, 3)
+
+            # Predict
+            probs = model.predict(input_batch, verbose=0)[0]  # (3,)
+            pred_class_idx = int(np.argmax(probs))
+            confidence = float(probs[pred_class_idx]) * 100
+
+            model_results.append({
+                "name": display_name,
+                "prediction": CLASS_NAMES[pred_class_idx],
+                "confidence": round(confidence, 1),
+            })
+            all_probabilities.append(probs)
+
+            # Yield the result of THIS model so the frontend can populate it specifically!
+            yield {"event": "model_result", "model": model_results[-1]}
+
+        yield {"event": "progress", "step": "Ensemble Voting"}
+
+        # --- Weighted Soft Voting ---
+        weights = np.array([VAL_ACCURACIES[n] for n in self.models.keys()])
+        weights = weights / weights.sum()
+
+        weighted_avg = np.average(all_probabilities, axis=0, weights=weights)
+        ensemble_class_idx = int(np.argmax(weighted_avg))
+        ensemble_confidence = float(weighted_avg[ensemble_class_idx]) * 100
+
+        yield {
+            "event": "complete",
+            "result": {
+                "prediction": CLASS_NAMES[ensemble_class_idx],
+                "confidence_score": round(ensemble_confidence, 2),
+                "models": model_results,
+            }
+        }
+
 
 # Global instance
 model_manager = ModelManager()

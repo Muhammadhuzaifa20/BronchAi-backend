@@ -16,7 +16,9 @@ import httpx
 from contextlib import asynccontextmanager
 from PIL import Image
 
+import json
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -204,6 +206,54 @@ async def predict_from_url(request: PredictRequest):
         gradcam_base64=gradcam_base64,
         scan_id=request.scan_id,
     )
+
+
+@app.post("/api/predict_stream")
+async def predict_stream_from_url(request: PredictRequest):
+    """
+    Run ensemble prediction on a CT scan image from URL using Server-Sent Events (NDJSON streaming).
+    """
+    # Lazy-load models on first request
+    ensure_models_loaded()
+
+    if not model_manager.models:
+        raise HTTPException(status_code=503, detail="Models failed to load. Check server logs.")
+
+    async def event_generator():
+        try:
+            # 1. Download the image
+            yield json.dumps({"event": "progress", "step": "Downloading image..."}) + "\n"
+            img_rgb = await download_image_from_url(request.image_url)
+
+            # 2. Run ensemble prediction and stream progress
+            final_result = None
+            for model_event in model_manager.predict_stream(img_rgb):
+                if model_event.get("event") == "complete":
+                    final_result = model_event["result"]
+                else:
+                    yield json.dumps(model_event) + "\n"
+
+            # 3. Generate Grad-CAM
+            if final_result:
+                yield json.dumps({"event": "progress", "step": "Grad-CAM Generation"}) + "\n"
+                gradcam_base64 = generate_gradcam_for_best_model(img_rgb)
+                
+                # Yield final payload
+                yield json.dumps({
+                    "event": "done",
+                    "result": {
+                        "prediction": final_result["prediction"],
+                        "confidence_score": final_result["confidence_score"],
+                        "models": final_result["models"],
+                        "gradcam_base64": gradcam_base64,
+                        "scan_id": request.scan_id,
+                    }
+                }) + "\n"
+        except Exception as e:
+            logger.error(f"Error during streaming prediction: {e}")
+            yield json.dumps({"event": "error", "message": str(e)}) + "\n"
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
 
 @app.post("/api/predict/upload", response_model=PredictResponse)
