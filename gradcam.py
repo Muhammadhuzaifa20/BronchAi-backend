@@ -12,6 +12,35 @@ import base64
 from io import BytesIO
 from PIL import Image
 
+_grad_models_cache = {}
+_grad_funcs_cache = {}
+
+def get_grad_step_func(grad_model):
+    """Wrap the gradient computation in a compiled static graph for maximum performance."""
+    @tf.function
+    def compute_gradients(img_array):
+        with tf.GradientTape() as tape:
+            conv_output, predictions = grad_model(img_array)
+            pred_index = tf.argmax(predictions[0])
+            class_channel = predictions[:, pred_index]
+
+        grads = tape.gradient(class_channel, conv_output)
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+        # Weight the conv output by the pooled gradients
+        conv_output = conv_output[0]
+        heatmap = conv_output @ pooled_grads[..., tf.newaxis]
+        heatmap = tf.squeeze(heatmap)
+
+        # Normalize: ReLU + scale to [0, 1]
+        heatmap = tf.maximum(heatmap, 0)
+        max_val = tf.math.reduce_max(heatmap)
+        if max_val > 0:
+            heatmap = heatmap / max_val
+            
+        return heatmap
+        
+    return compute_gradients
 
 def generate_gradcam_heatmap(model, img_array, last_conv_layer_name):
     """
@@ -25,37 +54,25 @@ def generate_gradcam_heatmap(model, img_array, last_conv_layer_name):
     Returns:
         heatmap: numpy array of shape (224, 224), values in [0, 1]
     """
-    # Build a model that outputs: last conv layer + final predictions
-    grad_model = tf.keras.models.Model(
-        inputs=model.inputs,
-        outputs=[
-            model.get_layer(last_conv_layer_name).output,
-            model.output
-        ]
-    )
+    cache_key = id(model)
+    
+    # 1. Cache the sub-model slicing so we don't rebuild memory-heavy graphs every upload
+    if cache_key not in _grad_models_cache:
+        grad_model = tf.keras.models.Model(
+            inputs=model.inputs,
+            outputs=[
+                model.get_layer(last_conv_layer_name).output,
+                model.output
+            ]
+        )
+        _grad_models_cache[cache_key] = grad_model
+        _grad_funcs_cache[cache_key] = get_grad_step_func(grad_model)
 
-    # Compute gradients
-    with tf.GradientTape() as tape:
-        conv_output, predictions = grad_model(img_array)
-        pred_index = tf.argmax(predictions[0])
-        class_channel = predictions[:, pred_index]
+    # 2. Run the tightly compiled math
+    heatmap_tensor = _grad_funcs_cache[cache_key](img_array)
 
-    grads = tape.gradient(class_channel, conv_output)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-    # Weight the conv output by the pooled gradients
-    conv_output = conv_output[0]
-    heatmap = conv_output @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-
-    # Normalize: ReLU + scale to [0, 1]
-    heatmap = tf.maximum(heatmap, 0)
-    max_val = tf.math.reduce_max(heatmap)
-    if max_val > 0:
-        heatmap = heatmap / max_val
-
-    # Ensure float32 numpy array (Keras 3 may return non-standard dtypes)
-    result = heatmap.numpy()
+    # Ensure float32 numpy array
+    result = heatmap_tensor.numpy()
     return np.asarray(result, dtype=np.float32)
 
 
