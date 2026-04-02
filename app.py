@@ -57,7 +57,10 @@ app = FastAPI(
 )
 
 # CORS — allow your React frontend to call this API
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://bronchai.netlify.app").split(",")
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS", 
+    "https://bronchai.netlify.app,https://bronchai.app,https://www.bronchai.app"
+).split(",")
 
 app.add_middleware(
     CORSMiddleware,
