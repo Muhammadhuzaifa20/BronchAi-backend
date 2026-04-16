@@ -9,3 +9,4 @@ Pillow==10.2.0
 huggingface-hub==0.20.3
 python-multipart==0.0.9
 httpx==0.27.0
+pydicom==2.4.4

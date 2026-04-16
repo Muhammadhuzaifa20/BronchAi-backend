@@ -10,6 +10,7 @@ Endpoints:
 import os
 import io
 import logging
+import base64
 import numpy as np
 import cv2
 import httpx
@@ -90,6 +91,7 @@ class PredictResponse(BaseModel):
     confidence_score: float
     models: list[ModelResult]
     gradcam_base64: Optional[str] = None
+    original_image_base64: Optional[str] = None
     scan_id: Optional[str] = None
 
 
@@ -103,25 +105,69 @@ async def download_image_from_url(url: str) -> np.ndarray:
             response = await client.get(url)
             response.raise_for_status()
 
-        img = Image.open(io.BytesIO(response.content))
-        img = img.convert("RGB")
-        img = img.resize(IMG_SIZE, Image.LANCZOS)
-        return np.array(img, dtype=np.uint8)
+        content = response.content
+        try:
+            img = Image.open(io.BytesIO(content))
+            img = img.convert("RGB")
+            img = img.resize(IMG_SIZE, Image.LANCZOS)
+            return np.array(img, dtype=np.uint8)
+        except Exception:
+            # Fallback for DICOM
+            import pydicom
+            dicom_data = pydicom.dcmread(io.BytesIO(content), force=True)
+            img = dicom_data.pixel_array
+            
+            # Normalize to 0-255
+            if img.max() > img.min():
+                img = (img - img.min()) / (img.max() - img.min()) * 255.0
+            img = img.astype(np.uint8)
+            
+            if len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            elif len(img.shape) == 3 and img.shape[2] == 1:
+                img = cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2RGB)
+                
+            img = cv2.resize(img, IMG_SIZE)
+            return img
 
     except Exception as e:
-        logger.error(f"Failed to download image from {url}: {e}")
-        raise HTTPException(status_code=400, detail=f"Could not download image: {str(e)}")
+        logger.error(f"Failed to download or parse image from {url}: {e}")
+        raise HTTPException(status_code=400, detail=f"Could not download or parse image: {str(e)}")
 
 
 def process_uploaded_file(file_bytes: bytes) -> np.ndarray:
     """Process an uploaded file and return as numpy array (RGB, 224x224)."""
     try:
-        img = Image.open(io.BytesIO(file_bytes))
-        img = img.convert("RGB")
-        img = img.resize(IMG_SIZE, Image.LANCZOS)
-        return np.array(img, dtype=np.uint8)
+        try:
+            img = Image.open(io.BytesIO(file_bytes))
+            img = img.convert("RGB")
+            img = img.resize(IMG_SIZE, Image.LANCZOS)
+            return np.array(img, dtype=np.uint8)
+        except Exception:
+            import pydicom
+            dicom_data = pydicom.dcmread(io.BytesIO(file_bytes), force=True)
+            img = dicom_data.pixel_array
+            
+            if img.max() > img.min():
+                img = (img - img.min()) / (img.max() - img.min()) * 255.0
+            img = img.astype(np.uint8)
+            
+            if len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            elif len(img.shape) == 3 and img.shape[2] == 1:
+                img = cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2RGB)
+                
+            img = cv2.resize(img, IMG_SIZE)
+            return img
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
+
+def array_to_base64_png(img_array: np.ndarray) -> str:
+    """Convert numpy array (RGB) to base64 PNG string for frontend display."""
+    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+    _, buffer = cv2.imencode('.png', img_bgr)
+    b64_str = base64.b64encode(buffer).decode('utf-8')
+    return f"data:image/png;base64,{b64_str}"
 
 
 def ensure_models_loaded():
@@ -199,14 +245,16 @@ async def predict_from_url(request: PredictRequest):
     # 2. Run ensemble prediction
     result = model_manager.predict(img_rgb)
 
-    # 3. Generate Grad-CAM
+    # 3. Generate Grad-CAM and Base64 Original Image
     gradcam_base64 = generate_gradcam_for_best_model(img_rgb)
+    original_image_base64 = array_to_base64_png(img_rgb)
 
     return PredictResponse(
         prediction=result["prediction"],
         confidence_score=result["confidence_score"],
         models=result["models"],
         gradcam_base64=gradcam_base64,
+        original_image_base64=original_image_base64,
         scan_id=request.scan_id,
     )
 
@@ -236,10 +284,11 @@ async def predict_stream_from_url(request: PredictRequest):
                 else:
                     yield json.dumps(model_event) + "\n"
 
-            # 3. Generate Grad-CAM
+            # 3. Generate Grad-CAM and Base64 Original Image
             if final_result:
                 yield json.dumps({"event": "progress", "step": "Grad-CAM Generation"}) + "\n"
                 gradcam_base64 = generate_gradcam_for_best_model(img_rgb)
+                original_image_base64 = array_to_base64_png(img_rgb)
                 
                 # Yield final payload
                 yield json.dumps({
@@ -249,6 +298,7 @@ async def predict_stream_from_url(request: PredictRequest):
                         "confidence_score": final_result["confidence_score"],
                         "models": final_result["models"],
                         "gradcam_base64": gradcam_base64,
+                        "original_image_base64": original_image_base64,
                         "scan_id": request.scan_id,
                     }
                 }) + "\n"
@@ -281,14 +331,16 @@ async def predict_from_upload(
     # 2. Run ensemble prediction
     result = model_manager.predict(img_rgb)
 
-    # 3. Generate Grad-CAM
+    # 3. Generate Grad-CAM and Base64 Original Image
     gradcam_base64 = generate_gradcam_for_best_model(img_rgb)
+    original_image_base64 = array_to_base64_png(img_rgb)
 
     return PredictResponse(
         prediction=result["prediction"],
         confidence_score=result["confidence_score"],
         models=result["models"],
         gradcam_base64=gradcam_base64,
+        original_image_base64=original_image_base64,
         scan_id=scan_id,
     )
 
