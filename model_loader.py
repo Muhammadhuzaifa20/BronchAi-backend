@@ -34,12 +34,13 @@ MODEL_FILES = {
     "EfficientNetB0":  "EfficientNetB0_best.keras",
 }
 
-# Validation accuracies from training — used for weighted voting
-VAL_ACCURACIES = {
-    "Sequential_CNN":  0.9479,
-    "VGG16":           0.9995,
-    "ResNet50":        0.9947,
-    "EfficientNetB0":  0.9879,
+# GA-optimised ensemble weights (Genetic Algorithm, best accuracy: 99.84%)
+# These are already normalised — do NOT re-normalise.
+GA_WEIGHTS = {
+    "Sequential_CNN":  0.0192,
+    "VGG16":           0.2603,
+    "ResNet50":        0.5931,
+    "EfficientNetB0":  0.1274,  # adjusted so sum == 1.0000
 }
 
 # Class names (must match the order from ImageDataGenerator)
@@ -200,8 +201,9 @@ class ModelManager:
             })
             all_probabilities.append(probs)
 
-        # --- Weighted Soft Voting ---
-        weights = np.array([VAL_ACCURACIES[n] for n in self.models.keys()])
+        # --- GA-Optimised Soft Voting ---
+        weights = np.array([GA_WEIGHTS[n] for n in self.models.keys()])
+        # Already normalised by GA; re-normalise for safety in case a model failed to load
         weights = weights / weights.sum()
 
         weighted_avg = np.average(all_probabilities, axis=0, weights=weights)
@@ -252,8 +254,9 @@ class ModelManager:
 
         yield {"event": "progress", "step": "Ensemble Voting"}
 
-        # --- Weighted Soft Voting ---
-        weights = np.array([VAL_ACCURACIES[n] for n in self.models.keys()])
+        # --- GA-Optimised Soft Voting ---
+        weights = np.array([GA_WEIGHTS[n] for n in self.models.keys()])
+        # Already normalised by GA; re-normalise for safety in case a model failed to load
         weights = weights / weights.sum()
 
         weighted_avg = np.average(all_probabilities, axis=0, weights=weights)
