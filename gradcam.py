@@ -15,6 +15,7 @@ from PIL import Image
 _grad_models_cache = {}
 _grad_funcs_cache = {}
 
+
 def get_grad_step_func(grad_model):
     """Wrap the gradient computation in a compiled static graph for maximum performance."""
     @tf.function
@@ -33,14 +34,17 @@ def get_grad_step_func(grad_model):
         heatmap = tf.squeeze(heatmap)
 
         # Normalize: ReLU + scale to [0, 1]
+        # Must use tf.where (not Python if) inside @tf.function graph mode,
+        # otherwise the condition is only evaluated once at trace time and can
+        # produce a permanently all-zero (black) heatmap.
         heatmap = tf.maximum(heatmap, 0)
         max_val = tf.math.reduce_max(heatmap)
-        if max_val > 0:
-            heatmap = heatmap / max_val
-            
+        heatmap = tf.where(max_val > 0, heatmap / max_val, heatmap)
+
         return heatmap
-        
+
     return compute_gradients
+
 
 def generate_gradcam_heatmap(model, img_array, last_conv_layer_name):
     """
@@ -55,7 +59,7 @@ def generate_gradcam_heatmap(model, img_array, last_conv_layer_name):
         heatmap: numpy array of shape (224, 224), values in [0, 1]
     """
     cache_key = id(model)
-    
+
     # 1. Cache the sub-model slicing so we don't rebuild memory-heavy graphs every upload
     if cache_key not in _grad_models_cache:
         grad_model = tf.keras.models.Model(
@@ -68,7 +72,7 @@ def generate_gradcam_heatmap(model, img_array, last_conv_layer_name):
         _grad_models_cache[cache_key] = grad_model
         _grad_funcs_cache[cache_key] = get_grad_step_func(grad_model)
 
-    # 2. Run the tightly compiled math
+    # 2. Run the compiled graph
     heatmap_tensor = _grad_funcs_cache[cache_key](img_array)
 
     # Ensure float32 numpy array
@@ -89,7 +93,6 @@ def create_gradcam_overlay(original_img, heatmap, alpha=0.4):
         overlay: BGR image with heatmap overlay, uint8
     """
     # Resize heatmap to match image dimensions
-    # Ensure float32 for OpenCV compatibility
     heatmap = np.asarray(heatmap, dtype=np.float32)
     heatmap_resized = cv2.resize(heatmap, (original_img.shape[1], original_img.shape[0]))
 
@@ -106,7 +109,7 @@ def create_gradcam_overlay(original_img, heatmap, alpha=0.4):
 
 def gradcam_to_base64(original_img_rgb, model, preprocessed_img, last_conv_layer_name):
     """
-    Full Grad-CAM pipeline: generate heatmap → overlay → encode as base64 PNG.
+    Full Grad-CAM pipeline: generate heatmap → overlay → encode as base64 JPEG.
 
     Args:
         original_img_rgb: RGB image, shape (224, 224, 3), uint8
@@ -115,7 +118,7 @@ def gradcam_to_base64(original_img_rgb, model, preprocessed_img, last_conv_layer
         last_conv_layer_name: Name of the target conv layer
 
     Returns:
-        base64 string of the overlay PNG image (with data URI prefix)
+        base64 string of the overlay JPEG image (with data URI prefix), or None on failure
     """
     try:
         # Generate heatmap
