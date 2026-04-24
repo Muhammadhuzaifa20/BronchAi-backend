@@ -303,19 +303,19 @@ async def predict_stream_from_url(request: PredictRequest):
                 loop = asyncio.get_running_loop()
                 gradcam_base64 = await loop.run_in_executor(ml_executor, generate_gradcam_for_best_model, img_rgb)
                 original_image_base64 = await loop.run_in_executor(ml_executor, array_to_base64_png, img_rgb)
-                    
-                    # Yield final payload
-                    yield json.dumps({
-                        "event": "done",
-                        "result": {
-                            "prediction": final_result["prediction"],
-                            "confidence_score": final_result["confidence_score"],
-                            "models": final_result["models"],
-                            "gradcam_base64": gradcam_base64,
-                            "original_image_base64": original_image_base64,
-                            "scan_id": request.scan_id,
-                        }
-                    }) + "\n"
+
+                # Yield final payload
+                yield json.dumps({
+                    "event": "done",
+                    "result": {
+                        "prediction": final_result["prediction"],
+                        "confidence_score": final_result["confidence_score"],
+                        "models": final_result["models"],
+                        "gradcam_base64": gradcam_base64,
+                        "original_image_base64": original_image_base64,
+                        "scan_id": request.scan_id,
+                    }
+                }) + "\n"
         except Exception as e:
             logger.error(f"Error during streaming prediction: {e}")
             yield json.dumps({"event": "error", "message": str(e)}) + "\n"
