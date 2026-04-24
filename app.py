@@ -9,6 +9,7 @@ Endpoints:
 
 import os
 import io
+import asyncio
 import logging
 import base64
 import numpy as np
@@ -32,6 +33,9 @@ from gradcam import gradcam_to_base64
 # ============================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Global lock to prevent OOM when multiple predictions are requested simultaneously
+ml_lock = asyncio.Lock()
 
 # ============================================================
 # LIFESPAN — Lazy loading: models loaded on first request, not startup
@@ -117,6 +121,10 @@ async def download_image_from_url(url: str) -> np.ndarray:
             dicom_data = pydicom.dcmread(io.BytesIO(content), force=True)
             img = dicom_data.pixel_array
             
+            # Handle 3D volumetric DICOM (Z, Y, X) to prevent OOM kills by taking the middle slice
+            if len(img.shape) == 3 and img.shape[0] > 3:
+                img = img[img.shape[0] // 2]
+            
             # Normalize to 0-255
             if img.max() > img.min():
                 img = (img - img.min()) / (img.max() - img.min()) * 255.0
@@ -148,6 +156,11 @@ def process_uploaded_file(file_bytes: bytes) -> np.ndarray:
             dicom_data = pydicom.dcmread(io.BytesIO(file_bytes), force=True)
             img = dicom_data.pixel_array
             
+            # Handle 3D volumetric DICOM (Z, Y, X) to prevent OOM kills by taking the middle slice
+            if len(img.shape) == 3 and img.shape[0] > 3:
+                img = img[img.shape[0] // 2]
+            
+            # Normalize to 0-255
             if img.max() > img.min():
                 img = (img - img.min()) / (img.max() - img.min()) * 255.0
             img = img.astype(np.uint8)
@@ -242,12 +255,13 @@ async def predict_from_url(request: PredictRequest):
     # 1. Download the image
     img_rgb = await download_image_from_url(request.image_url)
 
-    # 2. Run ensemble prediction
-    result = model_manager.predict(img_rgb)
+    # 2. Run ensemble prediction inside a lock to prevent concurrent OOM crashes
+    async with ml_lock:
+        result = await asyncio.to_thread(model_manager.predict, img_rgb)
 
-    # 3. Generate Grad-CAM and Base64 Original Image
-    gradcam_base64 = generate_gradcam_for_best_model(img_rgb)
-    original_image_base64 = array_to_base64_png(img_rgb)
+        # 3. Generate Grad-CAM and Base64 Original Image
+        gradcam_base64 = await asyncio.to_thread(generate_gradcam_for_best_model, img_rgb)
+        original_image_base64 = await asyncio.to_thread(array_to_base64_png, img_rgb)
 
     return PredictResponse(
         prediction=result["prediction"],
@@ -276,32 +290,33 @@ async def predict_stream_from_url(request: PredictRequest):
             yield json.dumps({"event": "progress", "step": "Downloading image..."}) + "\n"
             img_rgb = await download_image_from_url(request.image_url)
 
-            # 2. Run ensemble prediction and stream progress
+            # 2. Run ensemble prediction and stream progress inside a lock
             final_result = None
-            for model_event in model_manager.predict_stream(img_rgb):
-                if model_event.get("event") == "complete":
-                    final_result = model_event["result"]
-                else:
-                    yield json.dumps(model_event) + "\n"
+            async with ml_lock:
+                async for model_event in model_manager.predict_stream(img_rgb):
+                    if model_event.get("event") == "complete":
+                        final_result = model_event["result"]
+                    else:
+                        yield json.dumps(model_event) + "\n"
 
-            # 3. Generate Grad-CAM and Base64 Original Image
-            if final_result:
-                yield json.dumps({"event": "progress", "step": "Grad-CAM Generation"}) + "\n"
-                gradcam_base64 = generate_gradcam_for_best_model(img_rgb)
-                original_image_base64 = array_to_base64_png(img_rgb)
-                
-                # Yield final payload
-                yield json.dumps({
-                    "event": "done",
-                    "result": {
-                        "prediction": final_result["prediction"],
-                        "confidence_score": final_result["confidence_score"],
-                        "models": final_result["models"],
-                        "gradcam_base64": gradcam_base64,
-                        "original_image_base64": original_image_base64,
-                        "scan_id": request.scan_id,
-                    }
-                }) + "\n"
+                # 3. Generate Grad-CAM and Base64 Original Image
+                if final_result:
+                    yield json.dumps({"event": "progress", "step": "Grad-CAM Generation"}) + "\n"
+                    gradcam_base64 = await asyncio.to_thread(generate_gradcam_for_best_model, img_rgb)
+                    original_image_base64 = await asyncio.to_thread(array_to_base64_png, img_rgb)
+                    
+                    # Yield final payload
+                    yield json.dumps({
+                        "event": "done",
+                        "result": {
+                            "prediction": final_result["prediction"],
+                            "confidence_score": final_result["confidence_score"],
+                            "models": final_result["models"],
+                            "gradcam_base64": gradcam_base64,
+                            "original_image_base64": original_image_base64,
+                            "scan_id": request.scan_id,
+                        }
+                    }) + "\n"
         except Exception as e:
             logger.error(f"Error during streaming prediction: {e}")
             yield json.dumps({"event": "error", "message": str(e)}) + "\n"
@@ -326,14 +341,15 @@ async def predict_from_upload(
 
     # 1. Read uploaded file
     file_bytes = await file.read()
-    img_rgb = process_uploaded_file(file_bytes)
+    img_rgb = await asyncio.to_thread(process_uploaded_file, file_bytes)
 
-    # 2. Run ensemble prediction
-    result = model_manager.predict(img_rgb)
+    # 2. Run ensemble prediction inside a lock
+    async with ml_lock:
+        result = await asyncio.to_thread(model_manager.predict, img_rgb)
 
-    # 3. Generate Grad-CAM and Base64 Original Image
-    gradcam_base64 = generate_gradcam_for_best_model(img_rgb)
-    original_image_base64 = array_to_base64_png(img_rgb)
+        # 3. Generate Grad-CAM and Base64 Original Image
+        gradcam_base64 = await asyncio.to_thread(generate_gradcam_for_best_model, img_rgb)
+        original_image_base64 = await asyncio.to_thread(array_to_base64_png, img_rgb)
 
     return PredictResponse(
         prediction=result["prediction"],

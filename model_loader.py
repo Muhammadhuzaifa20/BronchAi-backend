@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import logging
+import asyncio
 import numpy as np
 import tensorflow as tf
 from huggingface_hub import hf_hub_download
@@ -216,7 +217,7 @@ class ModelManager:
             "models": model_results,
         }
 
-    def predict_stream(self, img_array: np.ndarray):
+    async def predict_stream(self, img_array: np.ndarray):
         """
         Run inference yielding progress events on all loaded models.
         Yields dictionaries with step names and temporary states.
@@ -237,8 +238,8 @@ class ModelManager:
             preprocessed = PREPROCESS_FUNCS[name](np.copy(img_array).astype("float32"))
             input_batch = np.expand_dims(preprocessed, axis=0)  # (1, 224, 224, 3)
 
-            # Predict
-            probs = model.predict(input_batch, verbose=0)[0]  # (3,)
+            # Predict (offloaded to thread to avoid blocking event loop)
+            probs = (await asyncio.to_thread(model.predict, input_batch, verbose=0))[0]  # (3,)
             pred_class_idx = int(np.argmax(probs))
             confidence = float(probs[pred_class_idx]) * 100
 
