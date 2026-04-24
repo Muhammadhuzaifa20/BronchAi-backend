@@ -227,8 +227,11 @@ class ModelManager:
     async def predict_stream(self, img_array: np.ndarray):
         """
         Run inference yielding progress events on all loaded models.
-        Yields dictionaries with step names and temporary states.
+        Sends periodic heartbeat events during long inference to keep
+        Railway's reverse proxy from dropping the connection.
         """
+        import gc
+
         if not self.models:
             raise RuntimeError("No models loaded! Call load_all() first.")
 
@@ -240,40 +243,68 @@ class ModelManager:
         for name, model in self.models.items():
             display_name = name if name != "Sequential_CNN" else "Custom CNN"
             yield {"event": "progress", "step": f"{display_name} Prediction"}
-            
-            # Prepare input: copy + preprocess
-            preprocessed = PREPROCESS_FUNCS[name](np.copy(img_array).astype("float32"))
-            input_batch = np.expand_dims(preprocessed, axis=0)  # (1, 224, 224, 3)
+            logger.info(f"  🔄 Starting {display_name} inference...")
 
-            # Predict (offloaded to dedicated ML thread, using direct call to avoid memory leak)
-            loop = asyncio.get_running_loop()
-            def _do_predict():
-                return model(input_batch, training=False).numpy()[0]
-                
-            probs = await loop.run_in_executor(ml_executor, _do_predict)  # (3,)
-            pred_class_idx = int(np.argmax(probs))
-            confidence = float(probs[pred_class_idx]) * 100
+            try:
+                # Prepare input: copy + preprocess
+                preprocessed = PREPROCESS_FUNCS[name](np.copy(img_array).astype("float32"))
+                input_batch = np.expand_dims(preprocessed, axis=0)  # (1, 224, 224, 3)
 
-            model_results.append({
-                "name": display_name,
-                "prediction": CLASS_NAMES[pred_class_idx],
-                "confidence": round(confidence, 1),
-            })
-            all_probabilities.append(probs)
+                # Predict — offloaded to dedicated ML thread
+                loop = asyncio.get_running_loop()
+                # Use default args to capture current values (avoids closure issues)
+                def _do_predict(_m=model, _ib=input_batch):
+                    return _m(_ib, training=False).numpy()[0]
 
-            # Yield the result of THIS model so the frontend can populate it specifically!
-            yield {"event": "model_result", "model": model_results[-1]}
+                future = loop.run_in_executor(ml_executor, _do_predict)
+
+                # Send heartbeat pings every 3 seconds while inference is running.
+                # This prevents Railway/Render proxy from killing the idle stream.
+                while True:
+                    try:
+                        probs = await asyncio.wait_for(asyncio.shield(future), timeout=3.0)
+                        break  # Inference completed
+                    except asyncio.TimeoutError:
+                        # Inference still running — send a keepalive ping
+                        yield {"event": "heartbeat", "model": display_name}
+
+                pred_class_idx = int(np.argmax(probs))
+                confidence = float(probs[pred_class_idx]) * 100
+
+                model_results.append({
+                    "name": display_name,
+                    "prediction": CLASS_NAMES[pred_class_idx],
+                    "confidence": round(confidence, 1),
+                })
+                all_probabilities.append(probs)
+
+                logger.info(f"  ⚡ {display_name} inference complete: {CLASS_NAMES[pred_class_idx]} ({confidence:.1f}%)")
+                yield {"event": "model_result", "model": model_results[-1]}
+
+                # Free memory between models
+                del preprocessed, input_batch, probs
+                gc.collect()
+
+            except Exception as e:
+                logger.error(f"  ❌ {display_name} inference failed: {e}")
+                yield {"event": "model_error", "model": display_name, "error": str(e)}
+                continue  # Skip this model, continue with the rest
+
+        if not model_results:
+            raise RuntimeError("All models failed during inference.")
 
         yield {"event": "progress", "step": "Ensemble Voting"}
 
         # --- GA-Optimised Soft Voting ---
-        weights = np.array([GA_WEIGHTS[n] for n in self.models.keys()])
-        # Already normalised by GA; re-normalise for safety in case a model failed to load
+        active_names = [r["name"].replace("Custom CNN", "Sequential_CNN") for r in model_results]
+        weights = np.array([GA_WEIGHTS.get(n, 0.0) for n in active_names])
         weights = weights / weights.sum()
 
         weighted_avg = np.average(all_probabilities, axis=0, weights=weights)
         ensemble_class_idx = int(np.argmax(weighted_avg))
         ensemble_confidence = float(weighted_avg[ensemble_class_idx]) * 100
+
+        logger.info(f"  🏁 Ensemble result: {CLASS_NAMES[ensemble_class_idx]} ({ensemble_confidence:.2f}%)")
 
         yield {
             "event": "complete",
