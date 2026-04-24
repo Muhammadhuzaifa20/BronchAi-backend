@@ -287,9 +287,7 @@ async def predict_stream_from_url(request: PredictRequest):
         try:
             # 1. Download the image
             yield json.dumps({"event": "progress", "step": "Downloading image..."}) + "\n"
-            logger.info(f"📥 Downloading image for scan {request.scan_id}...")
             img_rgb = await download_image_from_url(request.image_url)
-            logger.info(f"✅ Image downloaded ({img_rgb.shape})")
 
             # 2. Run ensemble prediction and stream progress
             final_result = None
@@ -302,22 +300,9 @@ async def predict_stream_from_url(request: PredictRequest):
             # 3. Generate Grad-CAM and Base64 Original Image
             if final_result:
                 yield json.dumps({"event": "progress", "step": "Grad-CAM Generation"}) + "\n"
-                logger.info("🎨 Starting Grad-CAM generation...")
                 loop = asyncio.get_running_loop()
-
-                # Grad-CAM with heartbeat keepalive
-                gradcam_future = loop.run_in_executor(ml_executor, generate_gradcam_for_best_model, img_rgb)
-                while True:
-                    try:
-                        gradcam_base64 = await asyncio.wait_for(asyncio.shield(gradcam_future), timeout=3.0)
-                        break
-                    except asyncio.TimeoutError:
-                        yield json.dumps({"event": "heartbeat", "step": "gradcam"}) + "\n"
-
-                logger.info("✅ Grad-CAM done")
-
+                gradcam_base64 = await loop.run_in_executor(ml_executor, generate_gradcam_for_best_model, img_rgb)
                 original_image_base64 = await loop.run_in_executor(ml_executor, array_to_base64_png, img_rgb)
-                logger.info(f"✅ Scan {request.scan_id} fully processed")
 
                 # Yield final payload
                 yield json.dumps({
