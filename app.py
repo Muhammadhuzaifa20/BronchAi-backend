@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
-from model_loader import model_manager, PREPROCESS_FUNCS, GRADCAM_LAYERS, IMG_SIZE
+from model_loader import model_manager, PREPROCESS_FUNCS, GRADCAM_LAYERS, IMG_SIZE, ml_executor
 from gradcam import gradcam_to_base64
 
 # ============================================================
@@ -34,8 +34,7 @@ from gradcam import gradcam_to_base64
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global lock to prevent OOM when multiple predictions are requested simultaneously
-ml_lock = asyncio.Lock()
+# Removed ml_lock, using dedicated ml_executor from model_loader instead
 
 # ============================================================
 # LIFESPAN — Lazy loading: models loaded on first request, not startup
@@ -255,13 +254,13 @@ async def predict_from_url(request: PredictRequest):
     # 1. Download the image
     img_rgb = await download_image_from_url(request.image_url)
 
-    # 2. Run ensemble prediction inside a lock to prevent concurrent OOM crashes
-    async with ml_lock:
-        result = await asyncio.to_thread(model_manager.predict, img_rgb)
+    # 2. Run ensemble prediction inside dedicated ML executor
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(ml_executor, model_manager.predict, img_rgb)
 
-        # 3. Generate Grad-CAM and Base64 Original Image
-        gradcam_base64 = await asyncio.to_thread(generate_gradcam_for_best_model, img_rgb)
-        original_image_base64 = await asyncio.to_thread(array_to_base64_png, img_rgb)
+    # 3. Generate Grad-CAM and Base64 Original Image
+    gradcam_base64 = await loop.run_in_executor(ml_executor, generate_gradcam_for_best_model, img_rgb)
+    original_image_base64 = await loop.run_in_executor(ml_executor, array_to_base64_png, img_rgb)
 
     return PredictResponse(
         prediction=result["prediction"],
@@ -290,20 +289,20 @@ async def predict_stream_from_url(request: PredictRequest):
             yield json.dumps({"event": "progress", "step": "Downloading image..."}) + "\n"
             img_rgb = await download_image_from_url(request.image_url)
 
-            # 2. Run ensemble prediction and stream progress inside a lock
+            # 2. Run ensemble prediction and stream progress
             final_result = None
-            async with ml_lock:
-                async for model_event in model_manager.predict_stream(img_rgb):
-                    if model_event.get("event") == "complete":
-                        final_result = model_event["result"]
-                    else:
-                        yield json.dumps(model_event) + "\n"
+            async for model_event in model_manager.predict_stream(img_rgb):
+                if model_event.get("event") == "complete":
+                    final_result = model_event["result"]
+                else:
+                    yield json.dumps(model_event) + "\n"
 
-                # 3. Generate Grad-CAM and Base64 Original Image
-                if final_result:
-                    yield json.dumps({"event": "progress", "step": "Grad-CAM Generation"}) + "\n"
-                    gradcam_base64 = await asyncio.to_thread(generate_gradcam_for_best_model, img_rgb)
-                    original_image_base64 = await asyncio.to_thread(array_to_base64_png, img_rgb)
+            # 3. Generate Grad-CAM and Base64 Original Image
+            if final_result:
+                yield json.dumps({"event": "progress", "step": "Grad-CAM Generation"}) + "\n"
+                loop = asyncio.get_running_loop()
+                gradcam_base64 = await loop.run_in_executor(ml_executor, generate_gradcam_for_best_model, img_rgb)
+                original_image_base64 = await loop.run_in_executor(ml_executor, array_to_base64_png, img_rgb)
                     
                     # Yield final payload
                     yield json.dumps({
@@ -343,13 +342,13 @@ async def predict_from_upload(
     file_bytes = await file.read()
     img_rgb = await asyncio.to_thread(process_uploaded_file, file_bytes)
 
-    # 2. Run ensemble prediction inside a lock
-    async with ml_lock:
-        result = await asyncio.to_thread(model_manager.predict, img_rgb)
+    # 2. Run ensemble prediction inside dedicated ML executor
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(ml_executor, model_manager.predict, img_rgb)
 
-        # 3. Generate Grad-CAM and Base64 Original Image
-        gradcam_base64 = await asyncio.to_thread(generate_gradcam_for_best_model, img_rgb)
-        original_image_base64 = await asyncio.to_thread(array_to_base64_png, img_rgb)
+    # 3. Generate Grad-CAM and Base64 Original Image
+    gradcam_base64 = await loop.run_in_executor(ml_executor, generate_gradcam_for_best_model, img_rgb)
+    original_image_base64 = await loop.run_in_executor(ml_executor, array_to_base64_png, img_rgb)
 
     return PredictResponse(
         prediction=result["prediction"],

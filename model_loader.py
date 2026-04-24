@@ -11,6 +11,7 @@ import sys
 import time
 import logging
 import asyncio
+import concurrent.futures
 import numpy as np
 import tensorflow as tf
 from huggingface_hub import hf_hub_download
@@ -87,6 +88,12 @@ PREPROCESS_FUNCS = {
     "EfficientNetB0":  preprocess_efficientnet,
 }
 
+# ============================================================
+# DEDICATED ML EXECUTOR
+# ============================================================
+# Single thread pool to ensure TensorFlow always uses the exact same OS thread.
+# This prevents TF from creating endless thread-local memory allocations which cause OOMs.
+ml_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 # ============================================================
 # MODEL LOADING
@@ -190,8 +197,8 @@ class ModelManager:
             preprocessed = PREPROCESS_FUNCS[name](np.copy(img_array).astype("float32"))
             input_batch = np.expand_dims(preprocessed, axis=0)  # (1, 224, 224, 3)
 
-            # Predict
-            probs = model.predict(input_batch, verbose=0)[0]  # (3,)
+            # Predict (using direct call instead of .predict() to avoid memory leak)
+            probs = model(input_batch, training=False).numpy()[0]  # (3,)
             pred_class_idx = int(np.argmax(probs))
             confidence = float(probs[pred_class_idx]) * 100
 
@@ -238,8 +245,12 @@ class ModelManager:
             preprocessed = PREPROCESS_FUNCS[name](np.copy(img_array).astype("float32"))
             input_batch = np.expand_dims(preprocessed, axis=0)  # (1, 224, 224, 3)
 
-            # Predict (offloaded to thread to avoid blocking event loop)
-            probs = (await asyncio.to_thread(model.predict, input_batch, verbose=0))[0]  # (3,)
+            # Predict (offloaded to dedicated ML thread, using direct call to avoid memory leak)
+            loop = asyncio.get_running_loop()
+            def _do_predict():
+                return model(input_batch, training=False).numpy()[0]
+                
+            probs = await loop.run_in_executor(ml_executor, _do_predict)  # (3,)
             pred_class_idx = int(np.argmax(probs))
             confidence = float(probs[pred_class_idx]) * 100
 
